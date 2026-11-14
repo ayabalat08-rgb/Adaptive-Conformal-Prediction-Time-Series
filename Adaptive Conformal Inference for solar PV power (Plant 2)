@@ -1,0 +1,93 @@
+# Project 2: Adaptive Conformal Inference for solar PV power (Plant 2) - one cell, start to finish
+import glob, os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+ALPHA, GAMMA, WINDOW = 0.10, 0.02, 500    # 90% intervals, ACI step size, score window
+STEP_MIN, SPD = 15, 96                    # 15-min data, 96 steps per day
+
+# ---------- 1) Load data (works for .csv, .csv.zip or .zip)
+gen = glob.glob('Plant_2_Generation_Data*')
+assert gen, "Upload the Plant 2 generation file to Colab first"
+df = pd.read_csv(gen[0])
+df['DATE_TIME'] = pd.to_datetime(df['DATE_TIME'], dayfirst=True)
+g = df.groupby('DATE_TIME').agg(p=('AC_POWER', 'sum'), n=('SOURCE_KEY', 'nunique'))
+g['p'] = g['p'] / g['n'] * g['n'].max()   # rescale when some inverters stop reporting
+y_all = g['p'].asfreq(f'{STEP_MIN}min')
+P_rated = y_all.quantile(0.999)
+y_all = y_all.clip(0, P_rated)
+
+# Extreme events are defined from irradiance ramps (a covariate), NOT from forecast errors
+assert os.path.exists('Plant_2_Weather_Sensor_Data.csv'), "Upload Plant_2_Weather_Sensor_Data.csv"
+w = pd.read_csv('Plant_2_Weather_Sensor_Data.csv')
+w['DATE_TIME'] = pd.to_datetime(w['DATE_TIME'], dayfirst=True)
+irr = w.set_index('DATE_TIME')['IRRADIATION'].reindex(y_all.index)
+event_signal = irr.diff().abs().where(irr > 0.05)
+
+# ---------- 2) Features (past information only)
+h = y_all.index.hour + y_all.index.minute / 60
+X = pd.DataFrame({'sin': np.sin(2*np.pi*h/24), 'cos': np.cos(2*np.pi*h/24),
+                  'lag1': y_all.shift(1), 'lag2': y_all.shift(2),
+                  'lag_day': y_all.shift(SPD),
+                  'roll4': y_all.shift(1).rolling(4).mean()}, index=y_all.index)
+data = pd.concat([X, y_all.rename('y')], axis=1).dropna()
+X, y = data.drop(columns='y'), data['y']
+event_signal = event_signal.reindex(y.index)
+
+# ---------- 3) Chronological split: train 30% | calibration 10% | online test 60%
+n = len(y); n_tr, n_cal = int(.3*n), int(.4*n)
+model = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05)
+model.fit(X.iloc[:n_tr], y.iloc[:n_tr])
+yhat = pd.Series(model.predict(X), index=y.index).clip(0, P_rated)
+sigma = 0.05*P_rated + 0.10*yhat
+score = (y - yhat).abs() / sigma
+
+# ---------- 4) Online ACI (Gibbs & Candes, 2021) + physical bounds
+def q_of(scores, a):
+    if a <= 0: return np.inf
+    if a >= 1: return 0.0
+    return np.quantile(scores, 1 - a)
+
+q_fixed = np.quantile(score.iloc[n_tr:n_cal], 1 - ALPHA)       # split-conformal baseline
+hist = list(score.iloc[n_tr:n_cal])
+a_t, rows = ALPHA, []
+for t in range(n_cal, n):
+    q = q_of(hist[-WINDOW:], a_t)
+    lo_raw = yhat.iloc[t] - q*sigma.iloc[t]
+    hi_raw = yhat.iloc[t] + q*sigma.iloc[t]
+    lo, hi = np.clip(lo_raw, 0, P_rated), np.clip(hi_raw, 0, P_rated)   # 0 <= P <= rated
+    miss = float(not (lo <= y.iloc[t] <= hi))
+    a_t = a_t + GAMMA*(ALPHA - miss)                                    # ACI update
+    hist.append(score.iloc[t])
+    fl = np.clip(yhat.iloc[t] - q_fixed*sigma.iloc[t], 0, P_rated)
+    fh = np.clip(yhat.iloc[t] + q_fixed*sigma.iloc[t], 0, P_rated)
+    rows.append((y.index[t], y.iloc[t], yhat.iloc[t], lo, hi, hi_raw-lo_raw,
+                 miss, float(not (fl <= y.iloc[t] <= fh)), fh-fl))
+res = pd.DataFrame(rows, columns=['t','y','yhat','lo','hi','w_raw','miss_aci',
+                                  'miss_split','w_split']).set_index('t')
+res['w_aci'] = res['hi'] - res['lo']
+
+# ---------- 5) Metrics
+sig = event_signal.reindex(res.index)
+ev = sig > sig.quantile(0.95)             # top 5% irradiance ramps = extreme events
+print(f"Target coverage: {1-ALPHA:.0%}")
+for name, col, wcol in [('ACI + physical bounds', 'miss_aci', 'w_aci'),
+                        ('Split conformal (fixed)', 'miss_split', 'w_split')]:
+    print(f"{name:26s} coverage all: {1-res[col].mean():.3f} | "
+          f"in extreme events: {1-res.loc[ev, col].mean():.3f} | "
+          f"mean width: {res[wcol].mean():.0f} kW")
+print(f"Width without physical clipping: {res['w_raw'].replace(np.inf, np.nan).mean():.0f} kW "
+      f"(with clipping: {res['w_aci'].mean():.0f} kW)")
+
+# ---------- 6) Plot (last 7 days)
+r = res.iloc[-7*SPD:]
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(r.index, r['lo'], r['hi'], color='orange', alpha=.3, label='90% ACI interval')
+ax.plot(r['y'], 'k', lw=.8, label='Actual AC power')
+ax.plot(r['yhat'], 'b--', lw=.8, label='Forecast (gradient boosting)')
+ax.set_ylabel('AC power (kW)')
+ax.set_title('Adaptive Conformal Prediction - Solar PV (Plant 2)', fontweight='bold')
+ax.legend(loc='upper right'); ax.grid(True, ls='--', alpha=.5)
+plt.tight_layout()
+plt.savefig('adaptive_conformal_prediction_plant2.png', dpi=300)
+plt.show()
